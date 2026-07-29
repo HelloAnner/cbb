@@ -118,7 +118,100 @@
   - 增加“最小可构造”契约测试。
 - 证据：本次测试记录见 `source-map.md`。
 
-## 3. 红线
+### PIT-008：Skill 方法论可见，但配套 Tool 没有授权
+
+- 发生时间：2026-07-16
+- 严重程度：P1
+- 症状：管理员请求创建 Skill 时，模型能看到 Skill Creator 方法论，却找不到需要的八个
+  生命周期 Tool。
+- 根因：
+  - Skill 和 Tool 实现已经发布，但既有数据库 Agent 策略没有同步加入配套 Tool；
+  - 历史发布脚本仍持有静态工具清单，形成第二个可写事实源；
+  - 原有链路没有校验“已启用 Skill 的 required companion Tool 必须全部授权”；
+  - 只补数据库授权后，direct Tool Search 首轮仍不暴露配套 Tool，真实回归依旧失败。
+- 修复：
+  - 数据库策略继续作为 Tool 授权唯一事实源；
+  - Platform 校验 Skill/companion 完整性，缺项直接失败而非运行时扩权；
+  - Kernel 直接暴露“已授权且所属 Skill 已启用”的配套 Tool；
+  - 补充 forward backfill、空库初始化和回归验证。
+- 预防测试：
+  - 每个 enabled Skill 的 required companion Tool 完整性；
+  - `skill_ref` 不能绕过数据库授权；
+  - companion Tool 只在 Skill 已启用且用户角色允许时可见；
+  - 真实 Job 能执行第一项必要 Tool。
+- 结论：Prompt、Skill 和 Tool 实现三者都正确，整体功能仍可能处于不可用的半启用状态。
+- 证据：
+  - `docs/bug/20260716-skill-creator-tools-not-authorized.md`
+  - `docs/agent/tool-search-runtime-policy.md`
+  - `kernel/tests/agent/test_react_tools_cache.py`
+  - `kernel/tests/subagents/test_subagent_policy.py`
+
+### PIT-009：Skill description 被错误解析并反向损坏源文件
+
+- 发生时间：2026-07-28
+- 症状：上传的 Skill 在 Agent Prompt 中只有路径，没有正常 description；数据库值变成单个
+  YAML 块标量标记 `>`。
+- 根因：
+  - 前端逐行截取 frontmatter，不支持 YAML 多行块；
+  - Platform 信任前端派生值，没有从原始 ZIP 重新安全解析；
+  - 多套独立解析器行为不一致；
+  - runtime-assets 契约一度漏传 description；
+  - 错误数据库值又被用于重写对象存储中的 `SKILL.md`。
+- 修复：
+  - 服务端统一安全 YAML codec；
+  - 上传包内 `SKILL.md` 成为 description 权威事实；
+  - runtime-assets 到 Kernel 完整传递 description；
+  - Platform description 优先于损坏的存储回退值。
+- 预防测试：
+  - `>`、`|`、引号、BOM、LF/CRLF；
+  - 上传预览、数据库、对象存储、runtime-assets 和 Prompt 五处一致；
+  - 错误前端派生值不能覆盖源包。
+- 结论：Skill 路由质量依赖元数据端到端完整性；Prompt Builder 单测通过不代表链路正确。
+- 证据：
+  - `docs/bug/20260728-skill-description-frontmatter-runtime-assets.md`
+  - `kernel/tests/services/test_runtime_assets_source.py`
+
+### PIT-010：Prompt 给出了 Skill 路径，但沙箱实际读取 404
+
+- 发生时间：2026-04-18；2026-05-22 跨仓库迁移后回归
+- 症状：模型按 Prompt 调用 `read("skills/<name>/SKILL.md")`，但返回文件不存在或路径越权。
+- 根因：
+  - Prompt 使用统一 `skills/` 路径，PathMapping 却指向空的个人技能目录；
+  - 合并层使用 symlink，读路径校验跟随 symlink 后认为越界；
+  - 仓库迁移只搬了主线代码，历史修复 patch 没有同步。
+- 修复：映射统一指向会话技能合并层；读写使用不同的 symlink 安全策略；迁移后重新应用修复。
+- 预防测试：
+  - 在真实沙箱文件视图读取 builtin/tenant Skill；
+  - Prompt 给出的每个 Skill 路径做端到端 read；
+  - 跨仓库/路径重构使用历史事故清单回归。
+- 结论：Prompt 路径、资产物化、PathGuard 和 Tool 执行必须作为一个契约验证。
+- 证据：`docs/bug/20260418-skill-read-404-pathmapping-symlink.md`
+
+### PIT-011：运行模式变化后，Skill 仍教模型调用不存在的动态分发器
+
+- 发生条件：关闭 `invoke_dynamic_tool`，但 Skill Markdown 仍包含强制
+  `tool_search → invoke_dynamic_tool` 的旧说明。
+- 症状：模型按 Skill 调用未暴露 Tool，或重复 Tool Search 但无法进入下一步。
+- 来源修复：读取/预展开 Skill 时，根据 direct/dynamic/no-search 能力投影正文，并有定向测试。
+- 剩余风险：当前实现依赖已知短语替换，不能证明任意自定义 Skill 的自由文本都会正确改写。
+- 迁移建议：用结构化 capability 声明生成运行时说明，并建立 Prompt/Tool Schema 一致性测试。
+- 证据：
+  - `kernel/core/prompts/system/runtime_projection.py`
+  - `kernel/core/prompts/system/tool_policy.py`
+  - `kernel/tests/prompts/test_tool_policy_runtime.py`
+
+## 3. 当前证据矛盾与剩余风险
+
+### GAP-001：Skill description “净化”强度与安全文档不完全一致
+
+- 安全文档把自定义 Tool/Skill description 注入列为攻击面，并描述“长度限制 + 注入模式检测”。
+- 当前 Tool description 实现包含可疑模式检测；当前 Skill description loader 只做 1,000 字符截断。
+- `docs/security/README.md` 将对应安全项总体标记为已修复，但现有代码不足以证明 Skill
+  description 已完成同等级检测。
+- CBB 结论：只能把“Skill description 有长度上限”写成当前事实；不能把“已充分防 Prompt
+  Injection”写成已验证事实。需要恶意 Skill 元数据/正文的对抗测试和维护者复核。
+
+## 4. 红线
 
 ### RED-001：工具必须“双门禁”
 
@@ -194,7 +287,51 @@
 - 强制措施：run-scoped state；tenant/run 进入缓存键；恢复时验证 owner。
 - 验证：并发多租户和旧 checkpoint 注入测试。
 
-## 4. AI 冲突处理
+### RED-011：Skill 与 Tool Search 不能授予权限
+
+- 禁止行为：根据 Skill 已启用、`skill_ref`、Prompt 文本或搜索命中，自动把 Tool 加入授权集合。
+- 后果：越权数据访问、高风险副作用和租户隔离失效。
+- 强制措施：数据库/可信策略形成不可变授权上限；Skill 和搜索结果只能在集合内求交。
+- 验证：全局 Registry 有 Tool 但 Agent 策略无 Tool、Skill 启用但 Tool 未授权、搜索显式写出
+  未授权 Tool 名三类拒绝测试。
+
+### RED-012：禁止 Skill 半启用
+
+- 禁止行为：required companion Tool 缺失时仍把 Skill 方法论注入 Prompt。
+- 后果：模型无进展循环、伪造完成、生产功能随机失效。
+- 强制措施：发布与 run 准备阶段完整性校验；缺项 fail closed 并给出结构化配置错误。
+- 验证：每个 required companion 缺一项、禁用一项、角色过滤一项的测试。
+
+### RED-013：Prompt 必须与真实 Tool 模式一致
+
+- 禁止行为：Prompt/Skill 要求调用本轮不存在的 Tool，或把 direct/dynamic 两种协议混用。
+- 后果：未暴露调用、重复 Tool Search、额外轮次和不可恢复失败。
+- 强制措施：Prompt 从同一份 RunSnapshot 投影；自由文本能力引用建立静态/运行时一致性检查。
+- 验证：direct、dynamic、no-search、text-only、子 Agent 五类 Prompt/Schema 快照测试。
+
+### RED-014：后续状态不能追溯性授权旧响应
+
+- 禁止行为：Tool Search 加载 Tool 后，用新工具集合执行加载前模型响应中的未暴露 Tool Call。
+- 后果：绕过本轮模型可见性审计，使事件与执行权限无法重放。
+- 强制措施：每个模型响应绑定不可变 `ModelTurnView`；执行只按该视图校验。
+- 验证：direct 模式搜索前旧 turn 拒绝、搜索后新 turn 允许。
+
+### RED-015：旧内容不能恢复已撤销能力
+
+- 禁止行为：因为历史对话含 Skill 正文、旧 Tool Schema 或 checkpoint loaded state，就恢复已撤销
+  Skill/Tool 权限。
+- 后果：撤权不生效、跨版本策略漂移和安全事故。
+- 强制措施：恢复时重新与当前可信授权求交，并验证资产版本、owner 和 Hash。
+- 验证：撤销后恢复、任务切换、跨租户旧 checkpoint 注入测试。
+
+### RED-016：自定义 Skill 内容不能成为安全事实
+
+- 禁止行为：从 Skill description/body 读取 actor、tenant、role、allowed tools 或系统安全例外。
+- 后果：持久 Prompt Injection、权限放大和策略覆盖。
+- 强制措施：Skill 来源审查与版本化；内容边界标记；身份/授权仅由服务端上下文注入和执行。
+- 验证：恶意 description/body、Tool 输出和 references 的对抗测试。
+
+## 5. AI 冲突处理
 
 如果目标项目要求触碰红线：
 

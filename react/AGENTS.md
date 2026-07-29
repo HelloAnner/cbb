@@ -10,11 +10,13 @@
   - 来源实现：Corevo Platform `upstream/dev@c7e869b54139e89743f8ae45c09e6fc2aef68320`
   - 来源仓库在采集时工作区干净，`HEAD`、本地 `upstream/dev` 和远端 `refs/heads/dev` 一致
   - 来源要求 Python 3.11+；本次选定测试使用来源仓库 `.venv`
-  - CBB 最小示例使用 Python 标准库、不依赖 Moss；已在 Python 3.9.6 运行 11 个测试
+  - CBB 示例使用 Python 标准库、不依赖 Moss；循环与 Prompt/Skill/Tool 关系共 23 个测试
 - 来源索引：[evidence/source-map.md](evidence/source-map.md)
 - 待验证原因：
   - CBB 提炼结果尚未经过独立复核；
   - 来源仓库选定测试中有 3 个测试因绕过构造函数创建 `ReactAgent`、未补新增运行时字段而失败，详见来源索引。
+  - 来源 `test_registry_subagent_assets.py` 还因导入已不存在的资产中间件符号而在测试收集阶段
+    失败，导致该模块的 Skill 资产回归当前无法执行。
 
 > 本目录中的 `react` 指 **ReAct（Reason + Act）Agent 循环**，不是 React 前端框架。
 
@@ -43,14 +45,16 @@ ReAct Agent Loop 把一次用户任务组织成有界的“模型判断 → 工�
 本目录不直接定义：
 
 - 某个 LLM Provider 的流式解析协议；
-- 完整 Prompt、Skill、Memory、RAG 或 Tool Search 实现；
+- 完整 Prompt 模板平台、Skill 发布系统、Memory、RAG 或 Tool Search 排序实现；
 - 具体工具业务逻辑和工具目录；
 - Job 队列、数据库 Schema、消息队列或前端 SSE 协议；
 - 沙箱、文件存储和租户权限的具体实现；
 - 子 Agent 的调度、递归和报告协议；
 - React 前端页面或组件开发规范。
 
-这些能力会影响循环，因此本目录必须说明接口和红线，但不应把它们全部实现进循环类。
+这些能力会影响循环，因此本目录必须说明接口、轮次关系和红线，但不应把它们全部实现进循环类。
+Prompt、Skill、Tool 与循环的详细关系见
+[PROMPT_SKILL_TOOL_FLOW.md](PROMPT_SKILL_TOOL_FLOW.md)。
 
 ## 3. 边界与依赖
 
@@ -71,7 +75,10 @@ ReAct Agent Loop 把一次用户任务组织成有界的“模型判断 → 工�
 - **外层 Job Runner**：全局 timeout、权威终态、持久化、计费、事件投递和补偿；
 - **Model Adapter**：Provider 格式、流式增量、tool call 拼装和 token usage；
 - **Context Manager**：消息历史、上下文预算、压缩、checkpoint 和恢复；
+- **Prompt Builder**：按运行时能力组装系统规则、Agent 指令、Skill 索引和环境上下文；
+- **Skill Runtime**：发布版本、元数据、正文、渐进式加载、资源投影和内容 Hash；
 - **Tool Registry / Executor**：schema、参数校验、执行、side effect、timeout 和并行安全；
+- **Tool Search**：在本 run 已授权候选内排序和加载工具，不负责授予权限；
 - **Policy / Security**：本次可见工具、用户与租户授权、计划模式和高风险操作审批；
 - **Event Sink**：事件 ID、顺序、重放、started/result 配对和外部投递；
 - **Sandbox / Artifact**：资源隔离、文件可见性、同步、引用和释放；
@@ -81,6 +88,8 @@ ReAct Agent Loop 把一次用户任务组织成有界的“模型判断 → 工�
 
 - 模型输出始终是不可信输入，包括工具名、参数、文本和终止声明。
 - 工具结果也可能包含不可信外部内容，不能自动提升为系统指令。
+- Skill description 和自定义 Skill 正文是模型指导内容，不是授权事实，且仍是 Prompt Injection
+  攻击面。
 - `allowed_tools`、身份、租户和权限上下文只能来自可信运行时，不能由模型填写。
 - Job、execution、step 和 tool call 标识由运行时生成或校验，不能依赖模型保证唯一。
 
@@ -94,6 +103,9 @@ ReAct Agent Loop 把一次用户任务组织成有界的“模型判断 → 工�
 - `ModelTurn`：正文、工具调用、usage 和 provider 终止原因；
 - `ToolRequest`：`call_id + tool_name + arguments`；
 - `ToolOutcome`：成功值或结构化错误；
+- `RunAssetSnapshot`：本 run 冻结的 Prompt/Skill/Tool 版本与授权集合；
+- `SkillProjection`：按本轮真实工具和委派能力投影后的 Skill 正文；
+- `ModelTurnView`：某次模型调用真正收到的消息与 Tool Schema 快照；
 - `RunResult`：循环输出和完整状态快照；
 - `Interrupt`：等待用户选择、计划审批或外部恢复的非完成终态。
 
@@ -113,6 +125,14 @@ ReAct Agent Loop 把一次用户任务组织成有界的“模型判断 → 工�
 12. 终态一旦提交不可被后到的 delta、重试或清理回调反向改写。
 13. 上下文压缩和恢复不能破坏 assistant tool call 与 tool result 的配对关系。
 14. 同一 run 使用启动时冻结的模型与工具/权限快照；运行途中默认不热切换。
+15. Prompt、Skill、Tool Search 和模型输出都不能扩大服务端 Tool 授权集合。
+16. Prompt 只能列出本 run 已启用的 Skill，Skill 元数据和正文必须可追溯到精确版本或 Hash。
+17. Skill 正文要求的 Tool 调用方式必须按真实运行能力投影，不能教模型调用不存在的路径。
+18. 已启用 Skill 的 required companion Tool 缺失时必须 fail closed，不能形成“方法论可见、
+    工具不可用”的半启用状态。
+19. Tool Search 只能从本 run 已授权候选中加载；direct 模式新工具从下一次模型调用开始可见。
+20. 执行模型 Tool Call 时按产生响应的 `ModelTurnView` 校验，不能使用后来扩大的工具集合。
+21. 旧对话、旧 checkpoint 或旧 Skill 正文不能恢复已撤销的 Skill/Tool 权限。
 
 ## 5. 已验证设计
 
@@ -185,6 +205,19 @@ Agent Loop 返回结果不等于 Job 已可靠完成。外层必须：
 - 保证终态不被 best-effort delta flush、遥测或文件同步无限阻塞；
 - 在投递失败时留下可修复事实。
 
+### 5.8 Prompt、Skill 与 Tool 是三条边界，不是一段大提示词
+
+来源实现的主 Agent 先把已启用 Skill 的名称、description 和读取路径放入 system prompt；模型
+明确匹配时通过 `read` 加载正文，正文作为 observation 进入后续轮次。即时子 Agent 为节省
+1–2 轮调用，会在预算内把正文预展开进 system prompt。
+
+Skill 关联 Tool 的 `skill_ref` 只表达实现归属。Tool 仍必须存在于数据库授权快照；已启用 Skill
+的 required companion Tool 缺失时应拒绝半启用状态。Tool Search 也只能在已授权候选内排序。
+
+Tool Search direct 模式把召回 Tool 放入下一次模型调用的顶层 Schema；dynamic 模式通过稳定
+分发器调用，但真实目标仍要验证已加载和已授权。完整设计、事故和验证矩阵见
+[PROMPT_SKILL_TOOL_FLOW.md](PROMPT_SKILL_TOOL_FLOW.md)。
+
 ## 6. 示例代码地图
 
 ### [examples/minimal_react_loop.py](examples/minimal_react_loop.py)
@@ -221,6 +254,25 @@ Agent Loop 返回结果不等于 Job 已可靠完成。外层必须：
 python3 -m unittest discover -s react/tests -v
 ```
 
+### [examples/prompt_skill_tool_flow.py](examples/prompt_skill_tool_flow.py)
+
+标准库边界示例，展示：
+
+- `RunSnapshot` 冻结已启用 Skill 和已授权 Tool；
+- Prompt 中 Skill 元数据索引与正文按需加载；
+- Skill capability 按 direct/dynamic/no-search 运行能力投影；
+- required companion Tool 完整性；
+- Tool Search 不能扩大授权；
+- 新加载 Tool 只影响后续 `ModelTurnView`；
+- 子 Agent 预算内预展开。
+
+它不实现真实模型、数据库、Skill 发布、搜索排序、沙箱或完整 Prompt Injection 防御。
+
+### [tests/test_prompt_skill_tool_flow.py](tests/test_prompt_skill_tool_flow.py)
+
+12 个标准库回归用例，覆盖 Skill 索引、半启用 fail closed、Skill/Tool 权限隔离、
+direct/dynamic 轮次、搜索候选收窄、旧轮暴露快照和子 Agent 预算。
+
 ## 7. 适配新项目的方法
 
 ### 先调查目标项目
@@ -229,7 +281,12 @@ python3 -m unittest discover -s react/tests -v
 
 - 谁创建和拥有一个 run，权威 Job 状态存在哪里？
 - 支持哪些 LLM Provider，流式 tool call 如何拼装和校验？
+- Prompt 的模块、优先级、版本、动态变量和输出模式如何定义？
+- Skill 由谁发布和审核，description/body/Hash 的事实源在哪里？
+- 主 Agent 懒加载 Skill，还是子 Agent 预算内预展开？超预算如何处理？
 - 工具 schema、权限、副作用、幂等、timeout 和并行安全由谁声明？
+- Skill required/optional capability 如何映射到已授权 Tool？缺项时是否 fail closed？
+- Tool Search 使用 direct 还是 dynamic 模式，加载结果从哪一轮生效？
 - 身份、租户和数据权限上下文来自哪里，是否能在 run 内冻结？
 - 取消来自用户、超时、worker shutdown 还是 lease/fencing 失效？
 - 消息历史和 checkpoint 是否跨进程、跨 Pod 恢复？
@@ -239,14 +296,17 @@ python3 -m unittest discover -s react/tests -v
 ### 推荐实施顺序
 
 1. 先定义状态、终态和 Interrupt，不从 `while` 循环开始。
-2. 冻结 `ModelPort`、`ToolPort`、`PolicyPort` 和外层 `JobRunner` 契约。
-3. 实现无工具的一轮问答和最大迭代边界。
-4. 实现单工具调用与严格的 call/result 配对。
-5. 加入参数、权限、安全、副作用和 timeout。
-6. 加入结构化错误、有限重试和重复调用保护。
-7. 加入上下文预算、压缩和 checkpoint。
-8. 加入权威事件、开放步骤补偿和终态可靠性。
-9. 最后增加安全并行、子 Agent 和产品特有终止门禁。
+2. 冻结 `ModelPort`、`ToolPort`、`PolicyPort`、`PromptPort`、`SkillPort` 和外层
+   `JobRunner` 契约。
+3. 建立不可变 Run 资产快照，先证明 Skill 与 Tool 授权不会互相隐式扩大。
+4. 实现无工具的一轮问答和最大迭代边界。
+5. 实现单工具调用与严格的 call/result 配对。
+6. 加入 Skill 元数据索引、按需正文加载和 Prompt/运行能力一致性测试。
+7. 加入参数、权限、安全、副作用、timeout 和 Tool Search 轮次。
+8. 加入结构化错误、有限重试和重复调用保护。
+9. 加入上下文预算、压缩和 checkpoint。
+10. 加入权威事件、开放步骤补偿和终态可靠性。
+11. 最后增加安全并行、子 Agent、Skill 预展开和产品特有终止门禁。
 
 ### 可调整项
 
@@ -277,6 +337,14 @@ python3 -m unittest discover -s react/tests -v
 - 只记录最终回答，不记录轮次、工具结果和错误来源；
 - 流式输出可见就误认为 Job 已提交成功；
 - 测试通过 `__new__` 或大量手工字段拼装半初始化对象，新增运行时字段后测试先于业务暴露漂移。
+- 把 Skill description、正文、Prompt、Tool Schema 和授权集合混成一个“能力开关”；
+- Skill 方法论要求调用 Tool，但发布/数据库策略没有同步授权配套 Tool；
+- Tool Search 找到全局 Registry 中的 Tool 后跳过 Agent 数据库授权；
+- direct 模式刚搜索完就按旧模型响应执行尚未暴露的真实 Tool；
+- 用自由文本替换修正任意 Skill 中的旧 Tool 名，却没有 Prompt/Schema 一致性测试；
+- Prompt 给出 `skills/x/SKILL.md`，但沙箱映射、symlink 或 PathGuard 实际无法读取；
+- Skill 多行 description 在上传、数据库、对象存储或 runtime-assets 某一层被截断；
+- 把自定义 Skill description/body 当作可信系统策略，忽略 Prompt Injection 风险。
 
 ### 已确认的真实踩坑
 
@@ -286,6 +354,13 @@ python3 -m unittest discover -s react/tests -v
 4. 任务意图安全门禁早退时没有结构化错误来源，前端只能显示“Kernel 未知失败”。
 5. 外层 timeout/cancel 截断工具时，SSE 与 metrics 曾缺少对应 `tool.call.result`。
 6. best-effort delta flush 曾阻塞权威终态，造成用户已经看到完整结果但后台把 Job 记为失败。
+7. Skill Creator 曾出现“方法论已可见、八个配套 Tool 未授权”的 P1 半启用事故；只补授权后
+   direct 模式仍未首轮暴露，真实回归依旧失败。
+8. Skill 多行 description 曾被误解析为单个 `>`，错误数据库值又覆盖对象存储中的原始
+   `SKILL.md`，最终破坏 Prompt 路由元数据。
+9. Skill 读取路径曾因 PathMapping 与 symlink/PathGuard 不一致返回 404，并在跨仓库迁移后
+   发生历史修复丢失回归。
+10. 生产 trace 中出现过重复读取同一 `SKILL.md`、没有推动任务进展。
 
 ### 红线
 
@@ -301,6 +376,12 @@ python3 -m unittest discover -s react/tests -v
 10. **禁止上下文压缩拆散或伪造 tool call/result 配对。**
 11. **禁止把 run 内缓存、checkpoint 或会话状态跨租户串用。**
 12. **禁止仅凭 Prompt 承担工具权限和安全控制。**
+13. **禁止让 Skill、`skill_ref` 或 Tool Search 自动扩大数据库 Tool 授权集合。**
+14. **禁止发布“Skill 已启用但 required companion Tool 未授权/不可达”的半启用状态。**
+15. **禁止让 Prompt/Skill 宣称与本 run Tool Search 模式不一致的调用路径。**
+16. **禁止用后续轮次扩大的工具集合追溯性地授权旧模型响应。**
+17. **禁止从旧历史、旧 checkpoint 或已撤销 Skill 内容恢复权限。**
+18. **禁止把自定义 Skill description/body 当作可信授权、身份或系统安全事实。**
 
 发现目标需求与这些红线冲突时，AI 必须停止相关设计或实现，指出冲突、后果和需要决策的负责人。
 
@@ -323,6 +404,15 @@ python3 -m unittest discover -s react/tests -v
 - 用户 Interrupt 不被当作普通成功或失败；
 - started/result 和唯一终态事件配对；
 - 清理、事件或持久化失败不会永久阻塞终态。
+- Prompt 只列已启用 Skill，禁用/越权 Skill 不出现；
+- Skill description/body 的来源、版本、Hash 和完整性可追溯；
+- Skill required companion Tool 完整性以及 Skill/Tool 各自禁用；
+- direct Tool Search 的下一轮生效和旧轮拒绝；
+- dynamic 分发器外壳与真实目标双校验；
+- Skill 正文按实际工具模式投影，不要求不存在的调用路径；
+- 恶意 Skill description/body 不能改变身份、租户和授权；
+- `runtime-assets → Prompt → read Skill → search → Tool Call` 端到端链路；
+- 沙箱中真实读取 Prompt 给出的 `skills/*/SKILL.md` 路径。
 
 ### 集成验证
 
@@ -338,8 +428,10 @@ python3 -m unittest discover -s react/tests -v
 
 - 来源重复调用保护/策略门禁子集：`8 passed, 30 deselected`；
 - 来源其他边界测试：`10 passed, 3 failed`；
+- 来源 Prompt/Skill/Tool 定向测试：结果见 [evidence/source-map.md](evidence/source-map.md)；
 - 3 个失败均为测试夹具通过 `ReactAgent.__new__()` 半初始化对象、未补 `_delegation_runtime_policy`，不是本次修改造成；这同时暴露了构造边界和测试方式的脆弱性；
-- CBB 最小示例：`11 tests, OK`；
+- 另有 1 个 registry subagent 资产测试模块因导入漂移无法收集；
+- CBB 循环与关系示例：`23 tests, OK`；
 - 真实 LLM API 测试文件存在，但本次采集未调用外部模型；
 - CBB 示例测试结果记录在 [evidence/source-map.md](evidence/source-map.md)。
 
@@ -348,6 +440,10 @@ python3 -m unittest discover -s react/tests -v
 ## 10. 与其他功能域的组合
 
 - **tool-search**：决定模型本轮看到哪些工具；不能越过 ReAct 的暴露快照和执行授权。
+- **skill-runtime（候选）**：负责发布、版本、审核、description/body、资源与 Hash；ReAct 只消费
+  冻结投影。
+- **prompt-runtime（候选）**：负责模块、优先级、版本、运行能力投影和 Prompt/Schema 一致性；
+  ReAct 只发送构建结果。
 - **subagent**：每个子 Agent 有独立 run state、预算和取消；父 Agent 负责 join、递归守卫和结果汇总。
 - **user**：提供可信 actor/tenant/session 上下文；等待用户输入应建模为 Interrupt。
 - **rbac**：授权结论进入 `PolicyPort`，但 ReAct 仍要执行本地 fail-closed 门禁。
@@ -366,6 +462,8 @@ python3 -m unittest discover -s react/tests -v
 - `agent-runtime`：Job、Execution、Step、Interrupt 和权威终态；
 - `context-management`：预算、压缩、checkpoint 和恢复；
 - `tool-runtime`：schema、执行、错误、幂等、缓存和并行；
+- `skill-runtime`：Skill 发布、审核、版本、内容投影和资源生命周期；
+- `prompt-runtime`：Prompt 模块、优先级、版本、动态上下文和对抗验证；
 - `runtime-events`：事件契约、重放、补偿与 metrics；
 - `sandbox`：执行隔离和资源生命周期。
 
@@ -378,6 +476,13 @@ python3 -m unittest discover -s react/tests -v
 - `kernel/core/agent/react.py`
 - `kernel/core/agent/state.py`
 - `kernel/core/agent/context.py`
+- `kernel/core/prompts/builder.py`
+- `kernel/core/prompts/system/runtime_projection.py`
+- `kernel/core/prompts/system/tool_policy.py`
+- `kernel/core/skills/`
+- `kernel/core/tools/tool_search.py`
+- `kernel/core/tools/builtin/read.py`
+- `docs/agent/tool-search-runtime-policy.md`
 - `kernel/core/agent/middleware/`
 - `kernel/core/services/task_runner.py`
 - `kernel/core/services/job/job_executor.py`
@@ -393,10 +498,12 @@ python3 -m unittest discover -s react/tests -v
 
 1. 本文件；
 2. [BOUNDARIES.md](BOUNDARIES.md)；
-3. [evidence/incidents-and-red-lines.md](evidence/incidents-and-red-lines.md)；
-4. [examples/minimal_react_loop.py](examples/minimal_react_loop.py)；
-5. [tests/test_minimal_react_loop.py](tests/test_minimal_react_loop.py)；
-6. 需要核验证据时再读 [evidence/source-map.md](evidence/source-map.md) 和源项目。
+3. [PROMPT_SKILL_TOOL_FLOW.md](PROMPT_SKILL_TOOL_FLOW.md)；
+4. [evidence/incidents-and-red-lines.md](evidence/incidents-and-red-lines.md)；
+5. [examples/minimal_react_loop.py](examples/minimal_react_loop.py)；
+6. [examples/prompt_skill_tool_flow.py](examples/prompt_skill_tool_flow.py)；
+7. 对应 `tests/`；
+8. 需要核验证据时再读 [evidence/source-map.md](evidence/source-map.md) 和源项目。
 
 ### 灵活探索
 
@@ -417,6 +524,7 @@ AI 应先给出：
 - 目标项目的运行时边界图；
 - 状态和终态表；
 - 模型/工具/策略/事件接口；
+- Prompt/Skill/Tool 的运行时快照、投影和轮次关系；
 - 不变量与红线清单；
 - timeout、取消、重试和恢复策略；
 - 最小测试矩阵；
@@ -433,3 +541,6 @@ AI 应先给出：
 ## 13. 变更记录
 
 - 2026-07-29：纠正目录含义为 ReAct Agent Loop；从 Corevo Platform 当前 `upstream/dev` 采集循环、边界、事故和测试证据；新增边界文档、证据索引及标准库最小示例；状态设为 `待验证`。
+- 2026-07-29：继续采集 Skill 元数据/正文、Prompt 构建、companion Tool、Tool Search
+  direct/dynamic 模式和 ReAct 轮次关系；新增关系文档、标准库示例、12 个测试及四类真实事故，
+  状态仍为 `待验证`。

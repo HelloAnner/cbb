@@ -32,6 +32,11 @@
 └──────────────┬────────────┘  └──────┬──────────────────────┘
                │                      │
 ┌──────────────▼──────────────────────▼───────────────────────┐
+│ Prompt + Skill Projection                                  │
+│ system modules、Skill index/body、runtime capability view   │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+┌─────────────────────────────▼───────────────────────────────┐
 │ Runtime Facilities                                         │
 │ Event Sink、Sandbox、Artifact、Persistence、Observability    │
 └─────────────────────────────────────────────────────────────┘
@@ -45,7 +50,10 @@
 | ReAct Loop | 轮次、状态迁移、工具调用与观察配对、循环内终止 | 数据库、MQ、对象存储和具体权限规则 |
 | Model Adapter | Provider 消息格式、流式增量、usage、finish reason | 工具授权与 Job 终态 |
 | Context Manager | 历史、token 预算、压缩、checkpoint | 决定工具是否可执行 |
+| Prompt Builder | 按运行能力组装系统模块、Agent 指令、Skill 索引和动态上下文 | 用文本授予 Tool 权限 |
+| Skill Runtime | Skill 版本、元数据、正文、资源、渐进加载与投影 | 自动扩大 Tool 白名单 |
 | Tool Registry | 工具定义、schema、side effect、parallel safety | 用户/租户最终授权 |
+| Tool Search | 在已授权候选内召回、加载并维护 run-scoped 状态 | 从全局 Registry 扩权 |
 | Tool Executor | 参数校验、单工具 timeout、实际执行、结构化结果 | 模型下一轮和 Job 状态 |
 | Policy/Security | 工具可见性、身份/租户/资源授权、高风险门禁 | 伪造工具结果或吞掉拒绝事实 |
 | Event Sink | 事件 ID、序号、持久化、重放与投递 | 反向决定业务是否成功 |
@@ -193,7 +201,45 @@ real_tool_name + canonical_json(validated_arguments)
 - best-effort delta 丢失不能阻断终态；
 - 终态投递失败有有限重试和持久事实，可供 repair。
 
-## 11. 灵活探索时的边界判断
+## 11. Prompt、Skill 与 Tool 暴露边界
+
+完整说明见 [PROMPT_SKILL_TOOL_FLOW.md](PROMPT_SKILL_TOOL_FLOW.md)。循环侧必须知道的最小协议是：
+
+```text
+RunSnapshot
+  ├─ enabled Skill + exact version/hash
+  ├─ authorized Tool + policy version
+  └─ Tool Search mode
+        │
+        ▼
+ModelTurnView N
+  ├─ system prompt / Skill index or projected body
+  └─ exposed tool schemas
+        │
+        ├─ read Skill ──────┐
+        └─ tool_search ─────┤ observation
+                            ▼
+                     ModelTurnView N+1
+```
+
+边界规则：
+
+- Prompt 和 Tool Schema 都是一次模型调用的快照；
+- 主 Agent 默认只注入 Skill 元数据，正文通过 `read` 进入后续 observation；
+- 子 Agent 可以预算内预展开正文，但使用同一份运行能力投影；
+- `skill_ref` 只表达实现归属，不能授予 Tool 权限；
+- Skill required companion Tool 缺失时 fail closed；
+- Tool Search 只在本 run 授权候选内工作；
+- direct 模式召回 Tool 从下一次模型调用开始可见；
+- dynamic 模式同时校验分发器外壳和真实目标；
+- 执行按产生当前响应的 `ModelTurnView` 校验，禁止追溯性扩权；
+- 历史 Skill 正文和旧 checkpoint 都不能恢复已撤销权限。
+
+Skill description/body 既是产品能力，也可能是 Prompt Injection 输入。是否允许自定义、由谁发布审核、
+如何签名和版本化属于 Skill Runtime；ReAct 必须坚持服务端授权和本轮暴露门禁，不能把这个风险
+交给 Prompt 自律。
+
+## 12. 灵活探索时的边界判断
 
 探索 ReAct 时可以继续追踪相邻模块，但按下面规则决定归属：
 
